@@ -1,0 +1,146 @@
+# Builds the backend image for the aalyria/artifact-keeper fork and publishes
+# it as ghcr.io/aalyria/artifact-keeper-backend:<version>, a multi-arch index
+# (linux/amd64, linux/arm64).
+#
+# The fork carries fixes that are not released upstream yet, on branches named
+# aalyria/v<upstream version>. Tag the branch head v<upstream version>-aalyria.<n>
+# (e.g. v1.11.11-aalyria.1) to publish :1.11.11-aalyria.1, or dispatch the
+# workflow with that tag name. Upstream's own publish workflows are disabled in
+# this fork.
+name: Aalyria backend image
+
+on:
+  push:
+    tags: ['v*-aalyria.*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag to build and publish, e.g. v1.11.11-aalyria.1. Must name an existing tag.'
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: aalyria-backend-image-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/${{ github.repository }}-backend
+  SOURCE_REF: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: Backend (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+            cargo-build-jobs: 4
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+            cargo-build-jobs: 4
+    steps:
+      - name: Check the tag
+        run: |
+          set -euo pipefail
+          if [[ ! "$SOURCE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-aalyria\.[0-9]+$ ]]; then
+            echo "::error::'$SOURCE_REF' is not a v<X.Y.Z>-aalyria.<n> tag."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.SOURCE_REF }}
+
+      # The Rust build stages need more than a stock hosted runner's free disk.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Log in to the container registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: ./docker/Dockerfile.backend
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }},mode=max,image-manifest=true,oci-mediatypes=true
+          provenance: false
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            APP_VERSION=${{ env.SOURCE_REF }}
+            CARGO_BUILD_JOBS=${{ matrix.cargo-build-jobs }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: backend-digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish multi-arch index
+    needs: [build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: /tmp/digests
+          pattern: backend-digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Log in to the container registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push the index
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          version="${SOURCE_REF#v}"
+          docker buildx imagetools create -t "${IMAGE}:${version}" \
+            $(printf "${IMAGE}@sha256:%s " *)
+          docker buildx imagetools inspect "${IMAGE}:${version}"
+          echo "### ${IMAGE}:${version}" >> "$GITHUB_STEP_SUMMARY"
+          docker buildx imagetools inspect "${IMAGE}:${version}" --format '{{json .Manifest.Digest}}' >> "$GITHUB_STEP_SUMMARY"

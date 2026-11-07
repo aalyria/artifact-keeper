@@ -10558,6 +10558,63 @@ pub(crate) fn ranged_stream_response_verified(
     Ok(response)
 }
 
+/// Honour a client `Range` on a proxied (remote cache hit or upstream) serve.
+///
+/// The proxy path streams the whole object, so a ranged request used to get a
+/// `200` with every byte. Clients that fetch byte windows and check each one
+/// against its own digest (apk segment fetches, resumable downloads) then fail.
+/// A `200` with a known `Content-Length` is re-served through
+/// [`ranged_stream_response`], so the generic download and the proxy path
+/// answer `Range` identically. The sliced stream still reads the upstream body
+/// to the end, so the proxy cache tee commits the whole object. Responses that
+/// are not a `200`, carry no `Content-Length`, or were not asked for a range
+/// pass through unchanged.
+pub(crate) fn apply_range_to_proxy_response(
+    response: Response,
+    range_header: Option<&str>,
+) -> Response {
+    use futures::StreamExt;
+
+    if range_header.is_none() || response.status() != StatusCode::OK {
+        return response;
+    }
+    let total = match response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        Some(total) => total,
+        None => return response,
+    };
+
+    let (parts, body) = response.into_parts();
+    let base_headers: Vec<(header::HeaderName, String)> = parts
+        .headers
+        .iter()
+        .filter(|(name, _)| {
+            *name != header::CONTENT_LENGTH
+                && *name != header::ACCEPT_RANGES
+                && *name != header::TRANSFER_ENCODING
+        })
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|v| (name.clone(), v.to_string()))
+        })
+        .collect();
+    let stream = body
+        .into_data_stream()
+        .map(|chunk| chunk.map_err(|e| AppError::Internal(format!("proxy body: {e}"))))
+        .boxed();
+
+    match ranged_stream_response(range_header, total, stream, base_headers) {
+        Ok(ranged) => ranged,
+        Err(e) => e.into_response(),
+    }
+}
+
 /// Serve one immutable stored revision of a versioned artifact (#2367).
 ///
 /// Streams the revision's bytes from content-addressed storage. No download
@@ -11097,7 +11154,14 @@ pub async fn download_artifact(
                             &dl_ctx,
                         )
                         .await;
-                        Ok(response.into_response())
+                        let range_header = request
+                            .headers()
+                            .get(header::RANGE)
+                            .and_then(|v| v.to_str().ok());
+                        Ok(apply_range_to_proxy_response(
+                            response.into_response(),
+                            range_header,
+                        ))
                     }
                     Err(e) => Ok(e.into_response()),
                 }
@@ -15000,6 +15064,66 @@ mod tests {
             .await
             .concat();
         assert_eq!(collected, b"defg");
+    }
+
+    fn proxied_200(body: &'static [u8], content_length: Option<usize>) -> Response {
+        let mut b = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header("x-checksum-sha256", "abc");
+        if let Some(len) = content_length {
+            b = b.header(header::CONTENT_LENGTH, len.to_string());
+        }
+        b.body(Body::from(body)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn proxy_response_honours_range() {
+        let resp = apply_range_to_proxy_response(
+            proxied_200(b"0123456789", Some(10)),
+            Some("bytes=2-4"),
+        );
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(resp.headers()[header::CONTENT_RANGE], "bytes 2-4/10");
+        assert_eq!(resp.headers()[header::CONTENT_LENGTH], "3");
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "application/octet-stream");
+        assert_eq!(resp.headers()["x-checksum-sha256"], "abc");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"234");
+    }
+
+    #[tokio::test]
+    async fn proxy_response_without_range_is_unchanged() {
+        let resp = apply_range_to_proxy_response(proxied_200(b"0123456789", Some(10)), None);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"0123456789");
+    }
+
+    #[tokio::test]
+    async fn proxy_response_without_length_ignores_range() {
+        // No Content-Length means no total for Content-Range, so the whole
+        // body is served as before.
+        let resp = apply_range_to_proxy_response(proxied_200(b"0123456789", None), Some("bytes=2-4"));
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"0123456789");
+    }
+
+    #[tokio::test]
+    async fn proxy_response_out_of_bounds_range_is_416() {
+        let resp = apply_range_to_proxy_response(
+            proxied_200(b"0123456789", Some(10)),
+            Some("bytes=20-30"),
+        );
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(resp.headers()[header::CONTENT_RANGE], "bytes */10");
     }
 
     // -----------------------------------------------------------------------
